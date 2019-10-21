@@ -199,7 +199,7 @@ class SeqAttnMatch(nn.Module):
 
         # Mask padding
         y_mask = y_mask.unsqueeze(1).expand(scores.size())
-        scores.data.masked_fill_(y_mask.data, -float('inf'))
+        scores.data.masked_fill_(y_mask.data.bool(), -float('inf'))
 
         # Normalize with softmax
         alpha_flat = F.softmax(scores.view(-1, y.size(1)), dim=-1)
@@ -239,7 +239,7 @@ class BilinearSeqAttn(nn.Module):
         """
         Wy = self.linear(y) if self.linear is not None else y
         xWy = x.bmm(Wy.unsqueeze(2)).squeeze(2)
-        xWy.data.masked_fill_(x_mask.data, -float('inf'))
+        xWy.data.masked_fill_(x_mask.data.bool(), -float('inf'))
         if self.normalize:
             if self.training:
                 # In training we output log-softmax for NLL
@@ -272,7 +272,7 @@ class LinearSeqAttn(nn.Module):
         """
         x_flat = x.view(-1, x.size(-1))
         scores = self.linear(x_flat).view(x.size(0), x.size(1))
-        scores.data.masked_fill_(x_mask.data, -float('inf'))
+        scores.data.masked_fill_(x_mask.data.bool(), -float('inf'))
         alpha = F.softmax(scores, dim=-1)
         return alpha
 

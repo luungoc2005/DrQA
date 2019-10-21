@@ -16,6 +16,8 @@ import logging
 from multiprocessing import Pool as ProcessPool
 from multiprocessing.util import Finalize
 
+from tqdm import tqdm
+
 from ..reader.vector import batchify
 from ..reader.data import ReaderDataset, SortedBatchSampler
 from .. import reader
@@ -70,7 +72,7 @@ class DrQA(object):
             embedding_file=None,
             tokenizer=None,
             fixed_candidates=None,
-            batch_size=128,
+            batch_size=32,
             cuda=True,
             data_parallel=False,
             max_loaders=5,
@@ -254,8 +256,9 @@ class DrQA(object):
         # Push all examples through the document reader.
         # We decode argmax start/end indices asychronously on CPU.
         result_handles = []
-        num_loaders = min(self.max_loaders, math.floor(len(examples) / 1e3))
-        for batch in self._get_loader(examples, num_loaders):
+        # num_loaders = min(self.max_loaders, math.floor(len(examples) / 1e3))
+        num_loaders = 0
+        for batch in tqdm(self._get_loader(examples, num_loaders)):
             if candidates or self.fixed_candidates:
                 batch_cands = []
                 for ex_id in batch[-1]:
@@ -264,17 +267,18 @@ class DrQA(object):
                         'cands': candidates[ex_id[0]] if candidates else None
                     })
                 handle = self.reader.predict(
-                    batch, batch_cands, async_pool=self.processes
+                    batch, batch_cands, async_pool=None
                 )
             else:
-                handle = self.reader.predict(batch, async_pool=self.processes)
+                handle = self.reader.predict(batch, async_pool=None)
             result_handles.append((handle, batch[-1], batch[0].size(0)))
 
         # Iterate through the predictions, and maintain priority queues for
         # top scored answers for each question in the batch.
         queues = [[] for _ in range(len(queries))]
-        for result, ex_ids, batch_size in result_handles:
-            s, e, score = result.get()
+        for result, ex_ids, batch_size in tqdm(result_handles):
+            # s, e, score = result.get()
+            s, e, score = result
             for i in range(batch_size):
                 # We take the top prediction per split.
                 if len(score[i]) > 0:
