@@ -126,7 +126,10 @@ class Predictor(object):
 
         # Build the batch and run it through the model
         batch_exs = batchify([vectorize(e, self.model) for e in examples])
-        s, e, score = self.model.predict(batch_exs, candidates, top_n)
+        result = self.model.predict(batch_exs, candidates, top_n)
+        s = result[0]
+        e = result[1]
+        score = result[2]
 
         # Retrieve the predicted spans
         results = []

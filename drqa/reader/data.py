@@ -12,7 +12,7 @@ import unicodedata
 
 from torch.utils.data import Dataset
 from torch.utils.data.sampler import Sampler
-from .vector import vectorize
+from .vector import vectorize, vectorize_transformer
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +96,10 @@ class ReaderDataset(Dataset):
         return len(self.examples)
 
     def __getitem__(self, index):
-        return vectorize(self.examples[index], self.model, self.single_answer)
+        if self.model.model_type != 'transformer':
+            return vectorize(self.examples[index], self.model, self.single_answer)
+        else:
+            return vectorize_transformer(self.examples[index], self.model, self.single_answer)
 
     def lengths(self):
         return [(len(ex['document']), len(ex['question']))

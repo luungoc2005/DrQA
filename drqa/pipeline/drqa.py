@@ -18,7 +18,7 @@ from multiprocessing.util import Finalize
 
 from tqdm import tqdm
 
-from ..reader.vector import batchify
+from ..reader.vector import batchify, batchify_transformer , BERT_TOKENIZER
 from ..reader.data import ReaderDataset, SortedBatchSampler
 from .. import reader
 from .. import tokenizers
@@ -36,10 +36,14 @@ PROCESS_DB = None
 PROCESS_CANDS = None
 
 
-def init(tokenizer_class, tokenizer_opts, db_class, db_opts, candidates=None):
+def init(tokenizer_class, tokenizer_args, tokenizer_opts, db_class, db_opts, candidates=None):
     global PROCESS_TOK, PROCESS_DB, PROCESS_CANDS
-    PROCESS_TOK = tokenizer_class(**tokenizer_opts)
-    Finalize(PROCESS_TOK, PROCESS_TOK.shutdown, exitpriority=100)
+    if tokenizer_args is None:
+        PROCESS_TOK = tokenizer_class(**tokenizer_opts)
+    else:
+        PROCESS_TOK = tokenizer_class(*tokenizer_args, **tokenizer_opts)
+    if hasattr(PROCESS_TOK, 'shutdown'):
+        Finalize(PROCESS_TOK, PROCESS_TOK.shutdown, exitpriority=100)
     PROCESS_DB = db_class(**db_opts)
     Finalize(PROCESS_DB, PROCESS_DB.close, exitpriority=100)
     PROCESS_CANDS = candidates
@@ -51,7 +55,6 @@ def fetch_text(doc_id):
 
 
 def tokenize_text(text):
-    global PROCESS_TOK
     return PROCESS_TOK.tokenize(text)
 
 
@@ -112,6 +115,7 @@ class DrQA(object):
 
         logger.info('Initializing document reader...')
         reader_model = reader_model or DEFAULTS['reader_model']
+        self.reader_model = reader_model
         self.reader = reader.DocReader.load(reader_model, normalize=False)
         if embedding_file:
             logger.info('Expanding dictionary...')
@@ -124,11 +128,25 @@ class DrQA(object):
             self.reader.parallelize()
 
         if not tokenizer:
-            tok_class = DEFAULTS['tokenizer']
+            if reader_model != 'transformer':
+                tok_class = DEFAULTS['tokenizer']
+            else:
+                from transformers import BertTokenizer
+                tok_class = BertTokenizer.from_pretrained
         else:
-            tok_class = tokenizers.get_class(tokenizer)
-        annotators = tokenizers.get_annotators_for_model(self.reader)
-        tok_opts = {'annotators': annotators}
+            if reader_model != 'transformer':
+                tok_class = tokenizers.get_class(tokenizer)
+            else:
+                from transformers import BertTokenizer
+                tok_class = BertTokenizer.from_pretrained
+
+        if reader_model != 'transformer':
+            annotators = tokenizers.get_annotators_for_model(self.reader)
+            tok_opts = {'annotators': annotators}
+            tok_args = None
+        else:
+            tok_opts = {}
+            tok_args = ('bert-base-uncased',)
 
         # ElasticSearch is also used as backend if used as ranker
         if hasattr(self.ranker, 'es'):
@@ -145,7 +163,7 @@ class DrQA(object):
         self.processes = ProcessPool(
             num_workers,
             initializer=init,
-            initargs=(tok_class, tok_opts, db_class, db_opts, fixed_candidates)
+            initargs=(tok_class, tok_args, tok_opts, db_class, db_opts, fixed_candidates)
         )
 
     def _split_doc(self, doc):
@@ -174,14 +192,24 @@ class DrQA(object):
             self.batch_size,
             shuffle=False
         )
-        loader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            sampler=sampler,
-            num_workers=num_loaders,
-            collate_fn=batchify,
-            pin_memory=self.cuda,
-        )
+        if self.reader_model != 'transformer':
+            loader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                sampler=sampler,
+                num_workers=num_loaders,
+                collate_fn=batchify,
+                pin_memory=self.cuda,
+            )
+        else:
+            loader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                sampler=sampler,
+                num_workers=num_loaders,
+                collate_fn=batchify_transformer,
+                pin_memory=self.cuda,
+            )
         return loader
 
     def process(self, query, candidates=None, top_n=1, n_docs=5,
@@ -239,17 +267,26 @@ class DrQA(object):
             for rel_didx, did in enumerate(all_docids[qidx]):
                 start, end = didx2sidx[did2didx[did]]
                 for sidx in range(start, end):
-                    if (len(q_tokens[qidx].words()) > 0 and
-                            len(s_tokens[sidx].words()) > 0):
-                        examples.append({
-                            'id': (qidx, rel_didx, sidx),
-                            'question': q_tokens[qidx].words(),
-                            'qlemma': q_tokens[qidx].lemmas(),
-                            'document': s_tokens[sidx].words(),
-                            'lemma': s_tokens[sidx].lemmas(),
-                            'pos': s_tokens[sidx].pos(),
-                            'ner': s_tokens[sidx].entities(),
-                        })
+                    if self.reader_model == 'transformer':
+                        if (len(q_tokens[qidx]) > 0 and 
+                                len(s_tokens[sidx]) > 0):
+                            examples.append({
+                                'id': (qidx, rel_didx, sidx),
+                                'question': q_tokens[qidx],
+                                'document': s_tokens[sidx],
+                            })
+                    else:
+                        if (len(q_tokens[qidx].words()) > 0 and
+                                len(s_tokens[sidx].words()) > 0):
+                            examples.append({
+                                'id': (qidx, rel_didx, sidx),
+                                'question': q_tokens[qidx].words(),
+                                'qlemma': q_tokens[qidx].lemmas(),
+                                'document': s_tokens[sidx].words(),
+                                'lemma': s_tokens[sidx].lemmas(),
+                                'pos': s_tokens[sidx].pos(),
+                                'ner': s_tokens[sidx].entities(),
+                            })
 
         logger.info('Reading %d paragraphs...' % len(examples))
 
@@ -289,24 +326,51 @@ class DrQA(object):
                     else:
                         heapq.heappushpop(queue, item)
 
+        global BERT_TOKENIZER
+        if BERT_TOKENIZER is None:
+            from transformers import BertTokenizer
+            BERT_TOKENIZER = BertTokenizer.from_pretrained('bert-base-uncased')
+
         # Arrange final top prediction data.
         all_predictions = []
         for queue in queues:
             predictions = []
             while len(queue) > 0:
                 score, (qidx, rel_didx, sidx), s, e = heapq.heappop(queue)
-                prediction = {
-                    'doc_id': all_docids[qidx][rel_didx],
-                    'span': s_tokens[sidx].slice(s, e + 1).untokenize(),
-                    'doc_score': float(all_doc_scores[qidx][rel_didx]),
-                    'span_score': float(score),
-                }
-                if return_context:
-                    prediction['context'] = {
-                        'text': s_tokens[sidx].untokenize(),
-                        'start': s_tokens[sidx].offsets()[s][0],
-                        'end': s_tokens[sidx].offsets()[e][1],
+                if self.reader_model != 'transformer':
+                    prediction = {
+                        'doc_id': all_docids[qidx][rel_didx],
+                        'span': s_tokens[sidx].slice(s, e + 1).untokenize(),
+                        'doc_score': float(all_doc_scores[qidx][rel_didx]),
+                        'span_score': float(score),
                     }
+                    if return_context:
+                        prediction['context'] = {
+                            'text': s_tokens[sidx].untokenize(),
+                            'start': s_tokens[sidx].offsets()[s][0],
+                            'end': s_tokens[sidx].offsets()[e][1],
+                        }
+                else:
+                    sep_offset = len(q_tokens[qidx]) + 2
+                    # logger.info(f'start: {s}, end: {end}, offset: {sep_offset}, seq: {s_tokens[sidx]}')
+                    s = max(0, s - sep_offset)
+                    e = max(0, e - sep_offset)
+                    span = ' '.join(s_tokens[sidx][s:e+1])
+                    prediction = {
+                        'doc_id': all_docids[qidx][rel_didx],
+                        'span': span,
+                        'doc_score': float(all_doc_scores[qidx][rel_didx]),
+                        'span_score': float(score),
+                    }
+                    if return_context:
+                        all_tokens = s_tokens[sidx]
+                        start_offset = len(' '.join(all_tokens[:s]))
+                        end_offset = len(' '.join(all_tokens[:e + 1]))
+                        prediction['context'] = {
+                            'text': ' '.join(all_tokens),
+                            'start': start_offset,
+                            'end': end_offset,
+                        }
                 predictions.append(prediction)
             all_predictions.append(predictions[-1::-1])
 

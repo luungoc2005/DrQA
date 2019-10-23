@@ -9,6 +9,55 @@
 from collections import Counter
 import torch
 
+BERT_TOKENIZER = None
+
+def vectorize_transformer(ex, model, single_answer=False, max_length=512):
+    global BERT_TOKENIZER
+    if BERT_TOKENIZER is None:
+        from transformers import BertTokenizer
+        BERT_TOKENIZER = BertTokenizer.from_pretrained('bert-base-uncased')
+        tokenizer = BERT_TOKENIZER
+    else:
+        tokenizer = BERT_TOKENIZER
+
+    question, text = ex['question'], ex['document']
+    input_text = [tokenizer.cls_token] + question + [tokenizer.sep_token] + text + [tokenizer.sep_token]
+
+    if len(input_text) > max_length:
+        input_text = input_text[:max_length]
+    input_ids = tokenizer.convert_tokens_to_ids(input_text)
+
+    token_type_ids = [0 if i <= input_ids.index(tokenizer.sep_token_id) else 1 for i in range(max_length)]
+    attention_mask = [1 if i <= len(input_ids) else 0 for i in range(max_length)]
+
+    input_ids = torch.tensor(input_ids)
+    token_type_ids = torch.tensor(token_type_ids)
+    attention_mask = torch.tensor(attention_mask)
+
+    return input_ids, attention_mask, token_type_ids, ex['id']
+
+
+def batchify_transformer(batch):
+    ids = [ex[-1] for ex in batch]
+    docs = [ex[0] for ex in batch]
+    attention_masks = [ex[1] for ex in batch]
+    token_type_ids = [ex[2] for ex in batch]
+
+    max_length = max([len(q) for q in attention_masks])
+    # max_length = 512
+    batch_size = len(docs)
+
+    x = torch.LongTensor(batch_size, max_length).zero_()
+    x_masks = torch.FloatTensor(batch_size, max_length).zero_()
+    x_types = torch.LongTensor(batch_size, max_length).zero_()
+
+    for i in range(batch_size):
+        x[i,:len(docs[i])] = docs[i]
+        x_masks[i,:len(attention_masks[i])] = attention_masks[i]
+        x_types[i,:len(token_type_ids[i])] = token_type_ids[i]
+
+    return x, x_masks, x_types, ids
+
 
 def vectorize(ex, model, single_answer=False):
     """Torchify a single example."""

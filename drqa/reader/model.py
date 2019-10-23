@@ -15,6 +15,7 @@ import copy
 
 from .config import override_model_args
 from .rnn_reader import RnnDocReader
+from .utils import DotDict
 
 logger = logging.getLogger(__name__)
 
@@ -28,27 +29,32 @@ class DocReader(object):
     # Initialization
     # --------------------------------------------------------------------------
 
-    def __init__(self, args, word_dict, feature_dict,
+    def __init__(self, args, word_dict = None, feature_dict = None,
                  state_dict=None, normalize=True):
         # Book-keeping.
         self.args = args
         self.word_dict = word_dict
-        self.args.vocab_size = len(word_dict)
+        self.args.vocab_size = len(word_dict) if word_dict is not None else 0
         self.feature_dict = feature_dict
-        self.args.num_features = len(feature_dict)
+        self.args.num_features = len(feature_dict) if feature_dict is not None else 0
         self.updates = 0
         self.use_cuda = False
         self.parallel = False
+        self.model_type = args.model_type
 
         # Building network. If normalize if false, scores are not normalized
         # 0-1 per paragraph (no softmax).
         if args.model_type == 'rnn':
             self.network = RnnDocReader(args, normalize)
+        elif args.model_type == 'transformer':
+            from transformers import BertForQuestionAnswering
+            # self.network = BertForQuestionAnswering.from_pretrained('bert-large-cased-whole-word-masking-finetuned-squad')
+            self.network = BertForQuestionAnswering.from_pretrained('bert-large-uncased-whole-word-masking-finetuned-squad')
         else:
             raise RuntimeError('Unsupported model: %s' % args.model_type)
 
         # Load saved state
-        if state_dict:
+        if state_dict and args.model_type == 'rnn':
             # Load buffer separately
             if 'fixed_embedding' in state_dict:
                 fixed_embedding = state_dict.pop('fixed_embedding')
@@ -66,6 +72,9 @@ class DocReader(object):
         Output:
             added: set of tokens that were added.
         """
+        if self.model_type != 'rnn':
+            raise NotImplementedError()
+
         to_add = {self.word_dict.normalize(w) for w in words
                   if w not in self.word_dict}
 
@@ -95,6 +104,9 @@ class DocReader(object):
               dictionary are kept.
             embedding_file: path to text file of embeddings, space separated.
         """
+        if self.model_type != 'rnn':
+            raise NotImplementedError()
+
         words = {w for w in words if w in self.word_dict}
         logger.info('Loading pre-trained embeddings for %d words from %s' %
                     (len(words), embedding_file))
@@ -139,6 +151,9 @@ class DocReader(object):
         Args:
             words: iterable of tokens contained in dictionary.
         """
+        if self.model_type != 'rnn':
+            raise NotImplementedError()
+
         words = {w for w in words if w in self.word_dict}
 
         if len(words) == 0:
@@ -176,6 +191,9 @@ class DocReader(object):
         Args:
             state_dict: network parameters
         """
+        if self.model_type != 'rnn':
+            raise NotImplementedError()
+
         if self.args.fix_embeddings:
             for p in self.network.embedding.parameters():
                 p.requires_grad = False
@@ -197,6 +215,9 @@ class DocReader(object):
 
     def update(self, ex):
         """Forward a batch of examples; step the optimizer to update weights."""
+        if self.model_type != 'rnn':
+            raise NotImplementedError()
+
         if not self.optimizer:
             raise RuntimeError('No optimizer set.')
 
@@ -240,6 +261,9 @@ class DocReader(object):
     def reset_parameters(self):
         """Reset any partially fixed parameters to original states."""
 
+        if self.model_type != 'rnn':
+            raise NotImplementedError()
+
         # Reset fixed embeddings to original value
         if self.args.tune_partial > 0:
             if self.parallel:
@@ -281,25 +305,38 @@ class DocReader(object):
         # Transfer to GPU
         if self.use_cuda:
             inputs = [e if e is None else e.cuda(non_blocking=True)
-                      for e in ex[:5]]
+                      for e in ex[:-1]]
         else:
-            inputs = [e for e in ex[:5]]
+            inputs = [e for e in ex[:-1]]
 
         # Run forward
         with torch.no_grad():
-            score_s, score_e = self.network(*inputs)
+            result = self.network(*inputs)
+
+            score_s = result[0]
+            score_e = result[1]
+
+            if self.model_type == 'transformer':
+                # normalize
+                score_s = score_s.exp()
+                score_e = score_e.exp()
 
         # Decode predictions
         score_s = score_s.data.cpu()
         score_e = score_e.data.cpu()
+        max_len = 512
+        try:
+            max_len = self.args.max_len
+        except:
+            pass
         if candidates:
-            args = (score_s, score_e, candidates, top_n, self.args.max_len)
+            args = (score_s, score_e, candidates, top_n, max_len)
             if async_pool:
                 return async_pool.apply_async(self.decode_candidates, args)
             else:
                 return self.decode_candidates(*args)
         else:
-            args = (score_s, score_e, top_n, self.args.max_len)
+            args = (score_s, score_e, top_n, max_len)
             if async_pool:
                 return async_pool.apply_async(self.decode, args)
             else:
@@ -435,6 +472,10 @@ class DocReader(object):
     @staticmethod
     def load(filename, new_args=None, normalize=True):
         logger.info('Loading model %s' % filename)
+        # hack for loading pretrained BERT
+        if filename == 'transformer':
+            return DocReader(DotDict({'model_type': 'transformer'}))
+        
         saved_params = torch.load(
             filename, map_location=lambda storage, loc: storage
         )
@@ -449,6 +490,10 @@ class DocReader(object):
     @staticmethod
     def load_checkpoint(filename, normalize=True):
         logger.info('Loading model %s' % filename)
+        # hack for loading pretrained BERT
+        if filename == 'transformer':
+            return DocReader(DotDict({'model_type': 'transformer'}))
+        
         saved_params = torch.load(
             filename, map_location=lambda storage, loc: storage
         )
